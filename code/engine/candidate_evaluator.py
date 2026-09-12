@@ -1,9 +1,21 @@
-﻿import pandas as pd
+import pandas as pd
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Any, Optional
+from itertools import combinations
 
 class CandidatePlan:
-    def __init__(self, method: str, status: str, plan_str: str, total_amount: float, first_date: str, num_payments: int, option_id: Optional[str] = None, spending_changes: str = 'none', completes_by_deadline: bool = True):
+    def __init__(
+        self,
+        method: str,
+        status: str,
+        plan_str: str,
+        total_amount: float,
+        first_date: str,
+        num_payments: int,
+        option_id: Optional[str] = None,
+        spending_changes: str = 'none',
+        completes_by_deadline: bool = True
+    ):
         self.method = method
         self.status = status
         self.plan_str = plan_str
@@ -15,7 +27,7 @@ class CandidatePlan:
         self.completes_by_deadline = completes_by_deadline
         
     def __repr__(self):
-        return f'<CandidatePlan {self.method} {self.status} amt={self.total_amount} changes={self.spending_changes}>'
+        return f'<CandidatePlan {self.method} {self.status} amt={self.total_amount} changes={self.spending_changes} deadline={self.completes_by_deadline}>'
 
 def parse_list(val) -> List[str]:
     if pd.isna(val) or not val:
@@ -36,7 +48,8 @@ class PlanEvaluator:
         daily_deltas: Dict[pd.Timestamp, float],
         amount_safe_today: float,
         earliest_full_date: Optional[str],
-        flexible_expenses: List[Dict[str, Any]]
+        flexible_occurrences: List[Dict[str, Any]],
+        flexible_catalog: List[Dict[str, Any]]
     ) -> List[CandidatePlan]:
         candidates: List[CandidatePlan] = []
         
@@ -50,12 +63,9 @@ class PlanEvaluator:
         
         allowed_methods = parse_list(profile.get('payment_methods_user_will_consider'))
         max_inst_months = profile.get('max_installment_months')
-        if pd.isna(max_inst_months) or max_inst_months is None:
-            max_inst_months = 0
-        else:
-            max_inst_months = float(max_inst_months)
+        max_inst_months = float(max_inst_months) if (pd.notna(max_inst_months) and max_inst_months is not None) else 0.0
             
-        # --- 1. Candidate Full Payment (No spending changes) ---
+        # --- 1. Full Payment (No spending changes) ---
         if 'full_payment' in allowed_methods and amount_safe_today >= req_amount - 1e-4:
             candidates.append(CandidatePlan(
                 method='full_payment',
@@ -69,7 +79,7 @@ class PlanEvaluator:
                 completes_by_deadline=(req_date <= desired_deadline)
             ))
             
-        # --- 2. Candidate Installment Options ---
+        # --- 2. Installment Options ---
         req_options = options_df[options_df['request_id'] == req_id]
         if 'installments' in allowed_methods and max_inst_months > 0:
             for _, opt in req_options.iterrows():
@@ -83,17 +93,29 @@ class PlanEvaluator:
                 f_date = pd.to_datetime(opt['first_payment_date'])
                 freq = int(opt['payment_frequency_days']) if pd.notna(opt['payment_frequency_days']) else 30
                 tot_amt = float(opt['total_payable_amount'])
-                opt_id = opt['payment_option_id']
+                opt_id = str(opt['payment_option_id'])
                 
                 inst_dates = [f_date + timedelta(days=i * freq) for i in range(num_p)]
                 last_inst_date = inst_dates[-1]
                 
-                pay_sched = {d: p_amt for d in inst_dates if d in daily_deltas}
-                traj = self.sim.simulate_trajectory(start_bal, daily_deltas, payment_schedule=pay_sched)
+                # Check that NO installment payment is silently omitted:
+                # All installment dates must be simulated
+                pay_sched = {d: p_amt for d in inst_dates}
                 
+                # Extend daily deltas if installment schedule extends past current dictionary
+                sim_deltas = dict(daily_deltas)
+                for d in inst_dates:
+                    if d not in sim_deltas:
+                        sim_deltas[d] = 0.0
+                        
+                traj = self.sim.simulate_trajectory(start_bal, sim_deltas, payment_schedule=pay_sched)
                 min_b = min(b for _, b in traj)
+                
                 if min_b >= min_bal - 1e-4:
-                    plan_parts = [d.strftime('%Y-%m-%d') + ':' + (str(int(p_amt)) if p_amt.is_integer() else f'{p_amt:.2f}') for d in inst_dates]
+                    plan_parts = [
+                        d.strftime('%Y-%m-%d') + ':' + (str(int(p_amt)) if p_amt.is_integer() else f'{p_amt:.2f}')
+                        for d in inst_dates
+                    ]
                     candidates.append(CandidatePlan(
                         method='installments',
                         status='affordable_with_plan',
@@ -106,15 +128,27 @@ class PlanEvaluator:
                         completes_by_deadline=(last_inst_date <= desired_deadline)
                     ))
                     
-        # --- 3. Candidate Partial Payment ---
-        allows_partial = bool(request['allows_partial_payment'])
-        if allows_partial and 'partial_payment' in allowed_methods:
-            if 0 < amount_safe_today < req_amount and earliest_full_date is not None:
-                efd = pd.to_datetime(earliest_full_date)
-                if efd <= desired_deadline:
-                    rem_amt = req_amount - amount_safe_today
-                    p1 = f'{req_date_str}:{int(amount_safe_today) if amount_safe_today.is_integer() else amount_safe_today:.2f}'
-                    p2 = f'{earliest_full_date}:{int(rem_amt) if rem_amt.is_integer() else rem_amt:.2f}'
+        # --- 3. Partial Payment ---
+        allows_partial = str(request.get('allows_partial_payment', 'false')).lower() in ['true', '1']
+        if (
+            allows_partial and
+            'partial_payment' in allowed_methods and
+            0 < amount_safe_today < req_amount - 1e-4 and
+            earliest_full_date is not None
+        ):
+            efd = pd.to_datetime(earliest_full_date)
+            if efd <= desired_deadline:
+                p1_amt = amount_safe_today
+                p2_amt = req_amount - amount_safe_today
+                p1 = f'{req_date_str}:{int(p1_amt) if p1_amt.is_integer() else p1_amt:.2f}'
+                p2 = f'{earliest_full_date}:{int(p2_amt) if p2_amt.is_integer() else p2_amt:.2f}'
+                
+                pay_sched = {req_date: p1_amt, efd: p2_amt}
+                sim_deltas = dict(daily_deltas)
+                if efd not in sim_deltas:
+                    sim_deltas[efd] = 0.0
+                traj = self.sim.simulate_trajectory(start_bal, sim_deltas, payment_schedule=pay_sched)
+                if min(b for _, b in traj) >= min_bal - 1e-4:
                     candidates.append(CandidatePlan(
                         method='partial_payment',
                         status='affordable_with_plan',
@@ -127,46 +161,68 @@ class PlanEvaluator:
                         completes_by_deadline=True
                     ))
                     
-        # --- 4. Candidate Flexible Spending Adjustments ---
-        if amount_safe_today < req_amount - 1e-4 and flexible_expenses and 'full_payment' in allowed_methods:
+        # --- 4. Flexible Spending Adjustments (1, 2, or 3 distinct modifications) ---
+        if amount_safe_today < req_amount - 1e-4 and flexible_catalog and 'full_payment' in allowed_methods:
             willing_stop = parse_list(profile.get('expense_categories_user_is_willing_to_stop'))
             willing_reduce = parse_list(profile.get('expense_categories_user_is_willing_to_reduce'))
             protect = parse_list(profile.get('expense_categories_to_protect'))
             
-            stoppable = [e for e in flexible_expenses if e['category'] in willing_stop and e['category'] not in protect]
-            reducible = [e for e in flexible_expenses if e['category'] in willing_reduce and e['category'] not in protect and e['minimum_allowed_amount'] is not None]
-            
-            adjustment_combos = []
-            for s in stoppable:
-                adjustment_combos.append([('stop', s)])
-            for r in reducible:
-                adjustment_combos.append([('reduce_to', r)])
-            for s in stoppable:
-                for r in reducible:
-                    if s['event_id'] != r['event_id']:
-                        adjustment_combos.append([('stop', s), ('reduce_to', r)])
+            # Form allowable individual actions per event_id
+            possible_actions = []
+            for item in flexible_catalog:
+                cat = item['category']
+                if cat in protect:
+                    continue
+                ev_id = item['event_id']
+                flex = item['flexibility']
+                amt = item['amount']
+                min_amt = item['minimum_allowed_amount']
+                
+                if (flex in ['stoppable', 'reducible_or_stoppable']) and (cat in willing_stop):
+                    possible_actions.append(('stop', ev_id, amt, f'stop:{ev_id}'))
+                    
+                if (flex in ['reducible', 'reducible_or_stoppable']) and (cat in willing_reduce) and (min_amt is not None):
+                    savings = amt - min_amt
+                    if savings > 0:
+                        change_str = f'reduce_to:{ev_id}:{int(min_amt) if min_amt.is_integer() else min_amt:.2f}'
+                        possible_actions.append(('reduce_to', ev_id, savings, change_str, min_amt))
                         
-            for combo in adjustment_combos:
+            # Sort actions by savings potential descending to bound search
+            possible_actions.sort(key=lambda a: a[2], reverse=True)
+            top_actions = possible_actions[:8]  # Bounded to top 8 actions
+            
+            # Generate valid combinations of 1, 2, and 3 actions (mutually exclusive event_ids)
+            valid_combos = []
+            for k in [1, 2, 3]:
+                for combo in combinations(top_actions, k):
+                    event_ids = [act[1] for act in combo]
+                    if len(set(event_ids)) == len(event_ids):
+                        valid_combos.append(combo)
+                        
+            # Test combinations in order of fewest changes, then highest savings
+            valid_combos.sort(key=lambda c: (len(c), -sum(act[2] for act in c)))
+            
+            for combo in valid_combos:
                 adj_deltas = dict(daily_deltas)
                 changes_strs = []
-                for action, item in combo:
-                    ev_id = item['event_id']
-                    amt = item['amount']
-                    if action == 'stop':
-                        changes_strs.append(f'stop:{ev_id}')
-                        dom = item['last_date'].day
-                        for d in adj_deltas:
-                            if d.day == dom:
-                                adj_deltas[d] += amt
-                    elif action == 'reduce_to':
-                        new_amt = item['minimum_allowed_amount']
-                        changes_strs.append(f'reduce_to:{ev_id}:{int(new_amt) if new_amt.is_integer() else new_amt:.2f}')
-                        diff = amt - new_amt
-                        dom = item['last_date'].day
-                        for d in adj_deltas:
-                            if d.day == dom:
-                                adj_deltas[d] += diff
-                                
+                action_by_eid = {act[1]: act for act in combo}
+                
+                # Apply changes directly to concrete flexible occurrences
+                for occ in flexible_occurrences:
+                    eid = occ['event_id']
+                    if eid in action_by_eid:
+                        act = action_by_eid[eid]
+                        o_date = occ['date']
+                        if act[0] == 'stop':
+                            adj_deltas[o_date] += occ['amount']
+                        elif act[0] == 'reduce_to':
+                            new_amt = act[4]
+                            savings = occ['amount'] - new_amt
+                            adj_deltas[o_date] += savings
+                            
+                for act in combo:
+                    changes_strs.append(act[3])
+                    
                 adj_safe = self.sim.calculate_amount_safe_to_pay(start_bal, min_bal, req_amount, adj_deltas)
                 if adj_safe >= req_amount - 1e-4:
                     candidates.append(CandidatePlan(
@@ -180,7 +236,7 @@ class PlanEvaluator:
                         spending_changes='|'.join(changes_strs),
                         completes_by_deadline=(req_date <= desired_deadline)
                     ))
-                    break
+                    break  # Found best minimal-change valid combination
                     
         # --- 5. Candidate Wait ---
         if 'full_payment' in allowed_methods and earliest_full_date is not None:
@@ -204,7 +260,7 @@ class PlanEvaluator:
             plan_str='none',
             total_amount=float('inf'),
             first_date='9999-12-31',
-            num_payments=0,
+            num_payments=999,
             option_id='payment_option_none',
             spending_changes='none',
             completes_by_deadline=False

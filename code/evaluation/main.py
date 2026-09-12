@@ -69,7 +69,7 @@ def evaluate_samples():
         req_date = pd.to_datetime(req['request_date'])
         
         # Cash schedule
-        daily_deltas, flexible_expenses, adjustments = cash_recon.get_user_cash_schedule(uid, req['request_date'], curr)
+        daily_deltas, flexible_occurrences, flexible_catalog, adjustments = cash_recon.get_user_cash_schedule(uid, req['request_date'], curr)
         
         # Base safety calculations
         amt_safe = simulator.calculate_amount_safe_to_pay(start_bal, min_bal, req_amt, daily_deltas)
@@ -77,7 +77,7 @@ def evaluate_samples():
         
         # Candidate plans
         candidates = evaluator.evaluate_all_candidates(
-            prof, req, df_options, daily_deltas, amt_safe, earliest_full, flexible_expenses
+            prof, req, df_options, daily_deltas, amt_safe, earliest_full, flexible_occurrences, flexible_catalog
         )
         
         best_plan = ranker.rank_candidates(candidates)
