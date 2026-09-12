@@ -1,4 +1,4 @@
-﻿import sys
+import sys
 from pathlib import Path
 
 # Add code/ directory to path
@@ -20,6 +20,16 @@ from engine.simulator import FinancialSimulator
 from engine.candidate_evaluator import PlanEvaluator
 from engine.ranker import PlanRanker
 from explainer.generator import DecisionExplainer
+
+def is_amount_close(pred: float, true_val: float, rel_tol: float = 0.05, abs_tol: float = 2.0) -> bool:
+    '''
+    Checks if predicted amount matches ground truth within relative or absolute tolerance.
+    '''
+    diff = abs(pred - true_val)
+    if diff <= abs_tol:
+        return True
+    denom = max(abs(true_val), 1.0)
+    return (diff / denom) <= rel_tol
 
 def evaluate_samples():
     print('Loading datasets for evaluation...')
@@ -75,13 +85,23 @@ def evaluate_samples():
         # Explanations
         expl = DecisionExplainer.generate_explanation(best_plan, req, prof, amt_safe, earliest_full)
         
+        safe_val = round(amt_safe, 2)
+        if safe_val.is_integer():
+            safe_val = int(safe_val)
+            
+        earliest_val = earliest_full or ''
+        if best_plan.status == 'affordable_now':
+            earliest_val = req['request_date']
+        elif best_plan.status == 'not_affordable':
+            earliest_val = ''
+            
         predictions.append({
             'request_id': req['request_id'],
-            'amount_safe_to_pay': round(amt_safe, 2),
+            'amount_safe_to_pay': safe_val,
             'affordability_status': best_plan.status,
             'recommended_payment_method': best_plan.method,
             'payment_plan': best_plan.plan_str,
-            'earliest_date_for_full_payment': earliest_full or '',
+            'earliest_date_for_full_payment': earliest_val,
             'spending_changes_needed': best_plan.spending_changes,
             'decision_explanation': expl
         })
@@ -97,9 +117,33 @@ def evaluate_samples():
     method_match = (df_pred['recommended_payment_method'] == df_samples['recommended_payment_method']).mean()
     changes_match = (df_pred['spending_changes_needed'] == df_samples['spending_changes_needed']).mean()
     
-    print(f'Affordability Status Accuracy: {status_match * 100:.1f}%')
-    print(f'Payment Method Accuracy:       {method_match * 100:.1f}%')
-    print(f'Spending Changes Accuracy:     {changes_match * 100:.1f}%')
+    # Safe amount tolerance metrics
+    safe_close_5 = [
+        is_amount_close(float(df_pred.loc[i, 'amount_safe_to_pay']), float(df_samples.loc[i, 'amount_safe_to_pay']), rel_tol=0.05, abs_tol=5.0)
+        for i in range(len(df_samples))
+    ]
+    safe_close_10 = [
+        is_amount_close(float(df_pred.loc[i, 'amount_safe_to_pay']), float(df_samples.loc[i, 'amount_safe_to_pay']), rel_tol=0.10, abs_tol=10.0)
+        for i in range(len(df_samples))
+    ]
+    
+    safe_acc_5 = np.mean(safe_close_5)
+    safe_acc_10 = np.mean(safe_close_10)
+    
+    all_core_match = [
+        (df_pred.loc[i, 'affordability_status'] == df_samples.loc[i, 'affordability_status']) and
+        (df_pred.loc[i, 'recommended_payment_method'] == df_samples.loc[i, 'recommended_payment_method']) and
+        safe_close_10[i]
+        for i in range(len(df_samples))
+    ]
+    strict_composite = np.mean(all_core_match)
+    
+    print(f'Affordability Status Accuracy:         {status_match * 100:.1f}%')
+    print(f'Payment Method Accuracy:               {method_match * 100:.1f}%')
+    print(f'Spending Changes Accuracy:             {changes_match * 100:.1f}%')
+    print(f'Amount Safe to Pay (within 5% tol):    {safe_acc_5 * 100:.1f}%')
+    print(f'Amount Safe to Pay (within 10% tol):   {safe_acc_10 * 100:.1f}%')
+    print(f'Composite Strict Accuracy (Status+Method+Amount<=10%): {strict_composite * 100:.1f}%')
     
     # Detailed comparison
     print('\nDetailed Breakdown:')
@@ -109,11 +153,15 @@ def evaluate_samples():
         p_status = df_pred.loc[i, 'affordability_status']
         t_method = df_samples.loc[i, 'recommended_payment_method']
         p_method = df_pred.loc[i, 'recommended_payment_method']
-        t_safe = df_samples.loc[i, 'amount_safe_to_pay']
-        p_safe = df_pred.loc[i, 'amount_safe_to_pay']
+        t_safe = float(df_samples.loc[i, 'amount_safe_to_pay'])
+        p_safe = float(df_pred.loc[i, 'amount_safe_to_pay'])
         
-        mark = 'OK' if (t_status == p_status and t_method == p_method) else 'MISMATCH'
-        print(f'[{mark}] {rid}: Status (True: {t_status} | Pred: {p_status}), Method (True: {t_method} | Pred: {p_method}), Safe (True: {t_safe} | Pred: {p_safe})')
+        safe_ok = safe_close_10[i]
+        core_ok = (t_status == p_status and t_method == p_method and safe_ok)
+        mark = 'OK' if core_ok else 'MISMATCH'
+        
+        diff_pct = (abs(p_safe - t_safe) / max(abs(t_safe), 1.0)) * 100
+        print(f'[{mark}] {rid}: Status (True: {t_status} | Pred: {p_status}), Method (True: {t_method} | Pred: {p_method}), Safe (True: {t_safe:.2f} | Pred: {p_safe:.2f} | Diff: {diff_pct:.1f}%)')
 
 if __name__ == '__main__':
     evaluate_samples()
