@@ -94,12 +94,6 @@ class CashFlowReconstructor:
                 if st in ['pending', 'scheduled']:
                     daily_deltas[s_date] -= amt
                     
-        # Check for failed debits that remain open within 10 days of request date
-        recent_failed = u_events[(u_events['status'] == 'failed') & (u_events['direction'] == 'debit')]
-        for _, ev in recent_failed.iterrows():
-            if abs((ev['settlement_date'] - req_date).days) <= 10:
-                daily_deltas[req_date] -= float(ev['norm_amount'])
-                
         # 2. Extract recurring events from past history
         past_events = u_events[u_events['settlement_date'] < req_date].copy()
         past_debits = past_events[(past_events['direction'] == 'debit') & (past_events['status'] == 'settled')]
@@ -118,6 +112,7 @@ class CashFlowReconstructor:
             last_date = dates[-1]
             last_amt = float(grp['norm_amount'].iloc[-1])
             ev_id = last_ev['event_id']
+            days_since = (req_date - last_date).days
             
             if cat == 'rent' and adjustments.get('rent_increase_pct', 0.0) > 0:
                 last_amt *= (1.0 + adjustments['rent_increase_pct'])
@@ -138,8 +133,8 @@ class CashFlowReconstructor:
                 diffs = [(dates[i+1] - dates[i]).days for i in range(len(dates)-1)]
                 median_diff = int(np.median(diffs))
                 
-                # Monthly recurring bills (27 to 32 day cadence)
-                if 27 <= median_diff <= 32:
+                # Active monthly recurring bills (27 to 32 day cadence, must be recent within 45 days)
+                if 27 <= median_diff <= 32 and days_since <= 45:
                     anchor_dom = last_date.day
                     projected_dates = generate_monthly_dates(req_date, anchor_dom, end_date)
                     for p_date in projected_dates:
@@ -154,8 +149,8 @@ class CashFlowReconstructor:
                                 'min_allowed': min_amt,
                                 'flexibility': flex
                             })
-                # Shorter cadence recurring essentials (e.g. weekly/biweekly)
-                elif 5 <= median_diff <= 25 and len(diffs) >= 3:
+                # Active shorter cadence recurring essentials (within 2*median_diff + 2 days)
+                elif 5 <= median_diff <= 25 and len(diffs) >= 3 and days_since <= (median_diff * 2 + 2):
                     curr = last_date + timedelta(days=median_diff)
                     while curr <= end_date:
                         if curr >= req_date:

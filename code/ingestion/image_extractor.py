@@ -110,6 +110,8 @@ def extract_valid_amounts(line: str) -> List[float]:
     # 3. Trailing .oo -> .00
     s = re.sub(r'\.[oO]{2}\b', '.00', s)
     s = re.sub(r'[?~`|]', '', s)
+    # Ignore ratio/fraction patterns like 11/76
+    s = re.sub(r'\b\d+/\d+\b', '', s)
     
     # Extract candidate amounts (avoiding account/phone numbers with >8 digits)
     tokens = re.findall(r'(?:[\$€₹]\s*)?(?:\b\d{1,3}(?:,\d{3})+|\b\d{1,8})(?:\.\d{1,2})?\b', s)
@@ -132,6 +134,7 @@ def extract_amount_from_ocr_text(lines: List[str]) -> Optional[float]:
     1. Legal 'Amount in Words' sections (statutory invoice requirement).
     2. Explicit financial total labels (Balance Due, Net Pay, Grand Total, Total Incl Taxes, Net Amount).
     3. Multi-line table alignments and proximity scans.
+    4. Fallback to largest plausible currency number.
     '''
     # 1. Statutory invoice 'Amount in words'
     for i, l in enumerate(lines):
@@ -142,36 +145,25 @@ def extract_amount_from_ocr_text(lines: List[str]) -> Optional[float]:
                 return val
 
     # 2. Priority labels
-    priority_labels = [
-        ('balance due', 16),
-        ('net pay', 16),
-        ('grand rota', 15),
+    financial_keywords = [
         ('grand total', 15),
-        ('total(lncl', 14),
-        ('total (incl', 14),
-        ('total incl', 14),
-        ('total order bill details', 13),
-        ('item bill', 13),
-        ('total paid', 12),
-        ('cash paid', 11),
-        ('net amount', 11),
-        ('total amount received', 10),
-        ('total amount to be receiv', 9),
-        ('total w amount', 9),
-        ('tocal w amount', 9),
-        ('total :', 8),
-        ('total:', 8),
-        ('amount due', 7),
-        ('total amount', 7),
-        ('total', 5)
+        ('balance due', 15),
+        ('net pay', 15),
+        ('net amount', 14),
+        ('amount paid', 13),
+        ('total paid', 13),
+        ('cash paid', 13),
+        ('total amount', 12),
+        ('item bill', 12),
+        ('total', 10)
     ]
     
-    # Priority search
     best_candidate = None
     for i, line in enumerate(lines):
         l_lower = line.lower()
-        for label, weight in priority_labels:
-            if label in l_lower:
+        l_norm = l_lower.replace('rota', 'total').replace('tocal', 'total').replace('iota', 'total')
+        for label, weight in financial_keywords:
+            if label in l_norm:
                 # Same line
                 same_amts = extract_valid_amounts(line)
                 if same_amts:
@@ -179,12 +171,11 @@ def extract_amount_from_ocr_text(lines: List[str]) -> Optional[float]:
                     if best_candidate is None or score > (best_candidate[1], -best_candidate[2]):
                         best_candidate = (same_amts[-1], weight, 0)
                         
-                # Next 1 to 6 lines
-                for dist in range(1, 7):
+                # Next lines (proximity scan)
+                for dist in range(1, 8):
                     if i + dist < len(lines):
                         next_line = lines[i + dist]
-                        # Don't cross into unrelated sections
-                        if any(k in next_line.lower() for k in ['gstin', 'pnr', 'patient', 'timing:', 'driver', 'license', 'dispatch']):
+                        if any(k in next_line.lower() for k in ['gstin', 'pnr', 'timing:', 'license', 'dispatch']):
                             break
                         next_amts = extract_valid_amounts(next_line)
                         if next_amts:
@@ -193,29 +184,24 @@ def extract_amount_from_ocr_text(lines: List[str]) -> Optional[float]:
                             if best_candidate is None or score > (best_candidate[1], -best_candidate[2]):
                                 best_candidate = (amt, weight, dist)
                                 
-                # Upward 1 to 2 lines for trailing summary labels
-                if label in ['grand total', 'grand rota', 'total']:
+                # Trailing total labels (looking upward if grand total/total label follows amounts)
+                if label in ['grand total', 'total']:
                     for dist in range(1, 3):
                         if i - dist >= 0:
                             prev_amts = extract_valid_amounts(lines[i - dist])
                             if prev_amts:
-                                score = (weight, -dist)
+                                score = (weight - 1, -dist - 10)
                                 if best_candidate is None or score > (best_candidate[1], -best_candidate[2]):
-                                    best_candidate = (prev_amts[-1], weight, dist)
-
-    # 3. Rent receipt table alignment (label block followed by value block)
-    if best_candidate is None or best_candidate[1] < 12:
-        for i, line in enumerate(lines):
-            if 'balance due' in line.lower():
-                for sub in lines[i:min(len(lines), i+12)]:
-                    amts = extract_valid_amounts(sub)
-                    if amts and any(n >= 1000 for n in amts):
-                        best_candidate = (amts[-1], 16, 0)
+                                    best_candidate = (prev_amts[-1], weight - 1, dist + 10)
 
     if best_candidate is not None:
         return best_candidate[0]
         
-    return None
+    # 3. Fallback: largest plausible currency-formatted number
+    all_amts = []
+    for l in lines:
+        all_amts.extend(extract_valid_amounts(l))
+    return max(all_amts) if all_amts else None
 
 def resolve_image_amounts(events_df: pd.DataFrame, images_df: pd.DataFrame) -> pd.DataFrame:
     '''
