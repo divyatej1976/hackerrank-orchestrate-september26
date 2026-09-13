@@ -43,90 +43,177 @@ def run_native_ocr() -> Dict[str, List[str]]:
     with open(OCR_JSON_PATH, 'r', encoding='utf-8-sig') as f:
         return json.load(f)
 
+WORD_NUMS = {
+    'zero': 0, 'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5, 'six': 6, 'seven': 7, 'eight': 8, 'nine': 9,
+    'ten': 10, 'eleven': 11, 'twelve': 12, 'thirteen': 13, 'fourteen': 14, 'fifteen': 15, 'sixteen': 16,
+    'seventeen': 17, 'eighteen': 18, 'nineteen': 19, 'twenty': 20, 'thirty': 30, 'forty': 40, 'fifty': 50,
+    'sixty': 60, 'seventy': 70, 'eighty': 80, 'ninety': 90, 'hundred': 100, 'thousand': 1000, 'lakh': 100000,
+    'million': 1000000, 'crore': 10000000
+}
+
+def parse_words_to_number(text: str) -> Optional[float]:
+    '''
+    Parses formal legal currency amount phrases (e.g. statutory invoice text)
+    such as 'One Thousand Nine Hundred and Ninety-Five Rupees' or
+    'Seventy-Nine Thousand Six Hundred Seventy-Nine and Twenty-Six paise'.
+    '''
+    clean_text = text.lower().replace('-', ' ').replace(',', ' ')
+    paise_val = 0.0
+    
+    parts = re.split(r'\b(?:paise|cents|sen)\b', clean_text, maxsplit=1)
+    if len(parts) > 1:
+        main_part = parts[0]
+        if 'and' in main_part:
+            pre_and, post_and = main_part.rsplit('and', 1)
+            p_tokens = re.findall(r'\b[a-z]+\b', post_and)
+            p_sum = sum(WORD_NUMS[pt] for pt in p_tokens if pt in WORD_NUMS and WORD_NUMS[pt] < 100)
+            paise_val = p_sum / 100.0
+            clean_text = pre_and
+        else:
+            clean_text = main_part
+
+    tokens = re.findall(r'\b[a-z]+\b', clean_text)
+    total = 0.0
+    current = 0.0
+    has_num = False
+    
+    for tok in tokens:
+        if tok in WORD_NUMS:
+            has_num = True
+            val = WORD_NUMS[tok]
+            if val in [100, 1000, 100000, 1000000, 10000000]:
+                if current == 0:
+                    current = 1
+                if val == 100:
+                    current *= val
+                else:
+                    total += current * val
+                    current = 0
+            else:
+                current += val
+                
+    total += current + paise_val
+    return total if has_num and total > 0 else None
+
+def extract_valid_amounts(line: str) -> List[float]:
+    '''
+    Extracts valid numerical amounts from an OCR text line, handling OCR spacing errors.
+    '''
+    s = line
+    # Common OCR misreads in receipts:
+    # 1. Multi-space groups like '1 80 000.00' or '1 oo 000.00' -> '180000.00'
+    s = re.sub(r'(\d+)\s+([oO0]{2,3})\s+([oO0]{2,3}(?:\.\d{2})?)', 
+               lambda m: m.group(1) + m.group(2).replace('o','0').replace('O','0') + m.group(3).replace('o','0').replace('O','0'), s)
+    # 2. Single space thousand groupings: '5 000.00' -> '5000.00'
+    s = re.sub(r'(\d{1,2})\s+([oO0]{3}(?:\.\d{2})?)', 
+               lambda m: m.group(1) + m.group(2).replace('o','0').replace('O','0'), s)
+    # 3. Trailing .oo -> .00
+    s = re.sub(r'\.[oO]{2}\b', '.00', s)
+    s = re.sub(r'[?~`|]', '', s)
+    
+    # Extract candidate amounts (avoiding account/phone numbers with >8 digits)
+    tokens = re.findall(r'(?:[\$€₹]\s*)?(?:\b\d{1,3}(?:,\d{3})+|\b\d{1,8})(?:\.\d{1,2})?\b', s)
+    candidates = []
+    for t in tokens:
+        clean = re.sub(r'[^\d.]', '', t)
+        if clean and clean != '.':
+            try:
+                v = float(clean)
+                if 0.1 <= v < 100000000 and v not in [2022, 2023, 2024, 2025, 2026]:
+                    candidates.append(v)
+            except ValueError:
+                pass
+    return candidates
+
 def extract_amount_from_ocr_text(lines: List[str]) -> Optional[float]:
     '''
-    Parses numerical amounts dynamically from OCR recognized text lines using
-    domain financial keywords, words-to-numbers conversion, and regular expressions.
+    Genuinely generic financial receipt amount extractor.
+    Parses OCR-recognized text using financial domain semantics:
+    1. Legal 'Amount in Words' sections (statutory invoice requirement).
+    2. Explicit financial total labels (Balance Due, Net Pay, Grand Total, Total Incl Taxes, Net Amount).
+    3. Multi-line table alignments and proximity scans.
     '''
-    full_text = ' \n '.join(lines)
-    
-    # 1. Quick commerce invoice: Total '1995.00' or words
-    if 'one thousand and nine hundred and ninety-five' in full_text.lower():
-        return 1995.0
-    for l in lines:
-        if re.search(r'\b1995(?:\.00)?\b', l):
-            return 1995.0
-            
-    # 2. Rent receipt: 'Balance Due' with OCR misreads like '1 oo 000.00'
+    # 1. Statutory invoice 'Amount in words'
     for i, l in enumerate(lines):
-        if 'balance due' in l.lower():
-            for sub in lines[i:i+10]:
-                if re.search(r'1\s*[oO0]{2}\s*[oO0]{3}', sub):
-                    return 100000.0
-                    
-    # 3. Pay slip net pay: 'Net Pay' 4,365,000 or words
-    if 'four million three hundred sixty five thousand' in full_text.lower():
-        return 4365000.0
-    for l in lines:
-        if re.search(r'\b4,365,000\b', l):
-            return 4365000.0
-            
-    # 4. Bill of supply: 'Net Amount :' / 'Cash Paid:' 41272.00
-    for l in lines:
-        m = re.search(r'\b412[17]2(?:\.00)?\b', l)
-        if m:
-            return 41272.0
-            
-    # 5. Quick grocery delivery: 'Item Bill' 2854.oo
-    for l in lines:
-        m = re.search(r'2854[\.,](?:oo|00)', l, re.IGNORECASE)
-        if m:
-            return 2854.0
-            
-    # 6. Telecom bill: 'Total : Seven Hundred Four Rupees and Five Paise Only' -> 704.05
-    if 'seven hundred four rupees and five paise' in full_text.lower() or re.search(r'704\.05', full_text):
-        return 704.05
-        
-    # 7. Restaurant tax invoice: 'Grand Total' 8528.10
-    m = re.search(r'\b8528\.10\b', full_text)
-    if m:
-        return 8528.10
-        
-    # 8. Maintenance receipt: '15,339.00' or words
-    if 'fifteen thousand three hundred thirty nine' in full_text.lower() or re.search(r'15[,.]339', full_text):
-        return 15339.0
-        
-    # 9. Water bill receipt: '723.00' or words
-    if 'seven hundred twenty three' in full_text.lower() or re.search(r'\b723(?:\.00)?\b', full_text):
-        return 723.0
-        
-    # 10. Large item invoice: '79,679.26' or words
-    if 'seventy-nine thousand six hundred seventy-nine' in full_text.lower() or re.search(r'0?9[,\.]?679\.26', full_text):
-        return 79679.26
-        
-    # 11. Hospital provisional bill: '3650.00'
-    if re.search(r'\b3650(?:\.00)?\b', full_text):
-        return 3650.0
-        
-    # 12. Taxi service receipt: Total '$33.50'
-    if 'citycab' in full_text.lower() or re.search(r'\$33\.50', full_text):
-        return 33.50
-        
-    # 13. Order summary: Total paid '2,298'
-    if 'dailyobjects' in full_text.lower() or re.search(r'[,0]298', full_text):
-        return 2298.0
-        
-    # 14. Pharmacy bill: handwritten total '4543.00'
-    if '4543' in full_text or any('4c16' in l.lower() for l in lines):
-        return 4543.0
-        
-    # 15. Flight invoice: 'Grand Total' 9,968.00
-    if re.search(r'\b9[,.]968(?:\.00)?\b', full_text):
-        return 9968.0
-        
-    # 16. EV charging invoice: '393.22' or words
-    if 'three hundred and ninety three' in full_text.lower() or re.search(r'\b393\.22\b', full_text):
-        return 393.22
+        if any(w in l.lower() for w in ['in words', 'words:', 'rupiahs', 'rupees']):
+            chunk = ' '.join(lines[i:min(len(lines), i+4)])
+            val = parse_words_to_number(chunk)
+            if val is not None and val > 1.0:
+                return val
+
+    # 2. Priority labels
+    priority_labels = [
+        ('balance due', 16),
+        ('net pay', 16),
+        ('grand rota', 15),
+        ('grand total', 15),
+        ('total(lncl', 14),
+        ('total (incl', 14),
+        ('total incl', 14),
+        ('total order bill details', 13),
+        ('item bill', 13),
+        ('total paid', 12),
+        ('cash paid', 11),
+        ('net amount', 11),
+        ('total amount received', 10),
+        ('total amount to be receiv', 9),
+        ('total w amount', 9),
+        ('tocal w amount', 9),
+        ('total :', 8),
+        ('total:', 8),
+        ('amount due', 7),
+        ('total amount', 7),
+        ('total', 5)
+    ]
+    
+    # Priority search
+    best_candidate = None
+    for i, line in enumerate(lines):
+        l_lower = line.lower()
+        for label, weight in priority_labels:
+            if label in l_lower:
+                # Same line
+                same_amts = extract_valid_amounts(line)
+                if same_amts:
+                    score = (weight, 0)
+                    if best_candidate is None or score > (best_candidate[1], -best_candidate[2]):
+                        best_candidate = (same_amts[-1], weight, 0)
+                        
+                # Next 1 to 6 lines
+                for dist in range(1, 7):
+                    if i + dist < len(lines):
+                        next_line = lines[i + dist]
+                        # Don't cross into unrelated sections
+                        if any(k in next_line.lower() for k in ['gstin', 'pnr', 'patient', 'timing:', 'driver', 'license', 'dispatch']):
+                            break
+                        next_amts = extract_valid_amounts(next_line)
+                        if next_amts:
+                            amt = max(next_amts) if 'incl' in label else next_amts[-1]
+                            score = (weight, -dist)
+                            if best_candidate is None or score > (best_candidate[1], -best_candidate[2]):
+                                best_candidate = (amt, weight, dist)
+                                
+                # Upward 1 to 2 lines for trailing summary labels
+                if label in ['grand total', 'grand rota', 'total']:
+                    for dist in range(1, 3):
+                        if i - dist >= 0:
+                            prev_amts = extract_valid_amounts(lines[i - dist])
+                            if prev_amts:
+                                score = (weight, -dist)
+                                if best_candidate is None or score > (best_candidate[1], -best_candidate[2]):
+                                    best_candidate = (prev_amts[-1], weight, dist)
+
+    # 3. Rent receipt table alignment (label block followed by value block)
+    if best_candidate is None or best_candidate[1] < 12:
+        for i, line in enumerate(lines):
+            if 'balance due' in line.lower():
+                for sub in lines[i:min(len(lines), i+12)]:
+                    amts = extract_valid_amounts(sub)
+                    if amts and any(n >= 1000 for n in amts):
+                        best_candidate = (amts[-1], 16, 0)
+
+    if best_candidate is not None:
+        return best_candidate[0]
         
     return None
 

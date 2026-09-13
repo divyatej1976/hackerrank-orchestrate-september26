@@ -172,5 +172,45 @@ class TestBuyOrWaitComprehensive(unittest.TestCase):
         errs = validate_output_dataframe(df_invalid, df_req)
         self.assertTrue(any('status is affordable_now but method is wait' in e for e in errs))
 
+    # 8. Non-recurring income & recurring salary projections
+    def test_recurring_income_not_from_one_off_credit(self):
+        # Verify that one-off credits (e.g. gift, refund) do not get projected as recurring income
+        req_date = pd.to_datetime('2025-06-01')
+        df_events = pd.DataFrame([
+            {'event_id': 'e1', 'user_id': 'u_test', 'event_type': 'income', 'category': 'gift',
+             'direction': 'credit', 'amount': 50000.0, 'currency': 'USD', 'event_date': '2025-05-15',
+             'settlement_date': pd.to_datetime('2025-05-15'), 'status': 'settled', 'flexibility': 'fixed',
+             'minimum_allowed_amount': np.nan, 'description': 'Birthday gift'}
+        ])
+        parser = MessageParser(pd.DataFrame([]))
+        cfr = CashFlowReconstructor(df_events, self.fx, parser)
+        daily_deltas, _, _, _ = cfr.get_user_cash_schedule('u_test', '2025-06-01', 'USD')
+        # All future days should have zero credit deltas from the one-off gift
+        self.assertTrue(all(delta <= 0.0 for delta in daily_deltas.values()))
+
+    # 9. Earliest Full Payment Date Boundaries
+    def test_earliest_full_payment_boundaries(self):
+        sim = FinancialSimulator(forecast_days=90)
+        start_bal = 1000.0
+        min_bal = 500.0
+        req_amt = 800.0
+        req_date = pd.to_datetime('2025-01-01')
+        
+        # Test 1: Day 0 safe immediately if start_bal - min_bal >= req_amt
+        daily_deltas_safe = {req_date + timedelta(days=i): 0.0 for i in range(91)}
+        earliest_immediate = sim.find_earliest_date_for_full_payment(1500.0, min_bal, req_amt, daily_deltas_safe, req_date)
+        self.assertEqual(earliest_immediate, '2025-01-01')
+
+        # Test 2: Inflow arrives on day 30, making it safe from day 30 onwards
+        daily_deltas = {req_date + timedelta(days=i): 0.0 for i in range(91)}
+        daily_deltas[req_date + timedelta(days=30)] = 1000.0
+        earliest_day30 = sim.find_earliest_date_for_full_payment(start_bal, min_bal, req_amt, daily_deltas, req_date)
+        self.assertEqual(earliest_day30, '2025-01-31')
+
+        # Test 3: Large late obligation on day 89 violates min balance -> cannot pay on day 30
+        daily_deltas[req_date + timedelta(days=89)] = -1500.0
+        earliest_blocked = sim.find_earliest_date_for_full_payment(start_bal, min_bal, req_amt, daily_deltas, req_date)
+        self.assertIsNone(earliest_blocked)
+
 if __name__ == '__main__':
     unittest.main()
