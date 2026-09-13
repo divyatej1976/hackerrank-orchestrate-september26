@@ -139,3 +139,65 @@ def validate_output_dataframe(df: pd.DataFrame, requests_df: pd.DataFrame) -> Li
             errors.append(f'Row {idx} ({rid}): decision_explanation is missing or too short')
             
     return errors
+
+def validate_plan_safety(
+    starting_balance: float,
+    min_balance: float,
+    daily_deltas: dict,
+    plan_str: str,
+    spending_changes: str,
+    flexible_occurrences: list
+) -> bool:
+    '''
+    Independently re-simulates cash flow trajectory under the recommended payment plan
+    and spending changes to strictly verify that closing balances never fall below minimum_balance_to_keep.
+    '''
+    if plan_str == 'none':
+        return True
+        
+    adj_deltas = dict(daily_deltas)
+    
+    # 1. Apply spending changes if present
+    if spending_changes != 'none':
+        mods = [m.strip() for m in spending_changes.split('|') if m.strip()]
+        mod_dict = {}
+        for m in mods:
+            if m.startswith('stop:'):
+                mod_dict[m.split(':')[1]] = ('stop', 0.0)
+            elif m.startswith('reduce_to:'):
+                parts = m.split(':')
+                mod_dict[parts[1]] = ('reduce_to', float(parts[2]))
+                
+        for occ in flexible_occurrences:
+            eid = occ['event_id']
+            if eid in mod_dict:
+                act, val = mod_dict[eid]
+                o_date = occ['date']
+                if act == 'stop':
+                    adj_deltas[o_date] += occ['amount']
+                elif act == 'reduce_to':
+                    savings = occ['amount'] - val
+                    adj_deltas[o_date] += savings
+                    
+    # 2. Parse payment schedule
+    payments = {}
+    for p in plan_str.split('|'):
+        p = p.strip()
+        if not p:
+            continue
+        m = re.match(r'^(\d{4}-\d{2}-\d{2}):([\d\.]+)$', p)
+        if m:
+            p_dt = pd.to_datetime(m.group(1))
+            payments[p_dt] = payments.get(p_dt, 0.0) + float(m.group(2))
+            
+    # 3. Simulate day-by-day closing balances
+    sorted_dates = sorted(adj_deltas.keys())
+    curr_bal = starting_balance
+    for d in sorted_dates:
+        curr_bal += adj_deltas[d]
+        if d in payments:
+            curr_bal -= payments[d]
+        if curr_bal < min_balance - 1e-4:
+            return False
+            
+    return True

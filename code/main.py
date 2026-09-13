@@ -21,7 +21,7 @@ from engine.simulator import FinancialSimulator
 from engine.candidate_evaluator import PlanEvaluator
 from engine.ranker import PlanRanker
 from explainer.generator import DecisionExplainer
-from utils.validator import validate_output_dataframe
+from utils.validator import validate_output_dataframe, validate_plan_safety
 from utils.packager import create_submission_zip
 
 def run_pipeline():
@@ -81,6 +81,11 @@ def run_pipeline():
             prof, req, df_options, daily_deltas, amt_safe, earliest_full, flexible_occurrences, flexible_catalog
         )
         best_plan = ranker.rank_candidates(candidates)
+        
+        # Independent safety validation: verify minimum_balance_to_keep invariant
+        is_safe = validate_plan_safety(start_bal, min_bal, daily_deltas, best_plan.plan_str, best_plan.spending_changes, flexible_occurrences)
+        if not is_safe:
+            raise ValueError(f"CRITICAL SAFETY VIOLATION: Plan {best_plan} violates minimum_balance_to_keep for request {req['request_id']}")
         
         # Grounded explanation
         expl = DecisionExplainer.generate_explanation(best_plan, req, prof, amt_safe, earliest_full)

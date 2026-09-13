@@ -34,9 +34,15 @@ class MessageParser:
             rel_ev = str(m.get('related_event_id', '')).strip() if pd.notna(m.get('related_event_id')) else None
             
             # 1. Termination / contract end
-            term_pattern = r'\b(?:contract (?:has )?ended|seasonal contract has ended|no off-season income|employment ended|resignation|kontrak (?:telah )?berakhir|pemutusan hubungan)\b'
-            if re.search(term_pattern, txt, re.IGNORECASE):
-                adjustments['salary_ended'] = True
+            # Differentiate partial termination (one household stream ended, remaining continues) from total termination
+            is_partial_term = bool(re.search(r'\b(?:one household employment record has ended|salah satu sumber pendapatan.*telah berakhir)\b', txt, re.IGNORECASE))
+            if is_partial_term:
+                # Do NOT end all salary; continuing stream remains active
+                adjustments['salary_ended'] = False
+            else:
+                term_pattern = r'\b(?:contract (?:has )?ended|seasonal contract has ended|no off-season income|employment has ended|resignation|kontrak (?:telah )?berakhir|pemutusan hubungan)\b'
+                if re.search(term_pattern, txt, re.IGNORECASE):
+                    adjustments['salary_ended'] = True
                 
             # 2. Unconfirmed / disputed credits to ignore
             unconf_pattern = r'\b(?:refund has been initiated but has not reached|reversal has not been posted|payout is still pending|isn\'t withdrawable|not withdrawable|belum disetujui|belum masuk|belum tercatat|tidak masuk pembayaran|no cash proceeds|market value has increased substantially|tidak ada hasil tunai)\b'
@@ -49,8 +55,12 @@ class MessageParser:
             if rent_m:
                 adjustments['rent_increase_pct'] = float(rent_m.group(1)) / 100.0
                 
+            rent_date_m = re.search(r'(?:rent.*effective from|applies from|berlaku mulai)\s+(\d{4}-\d{2}-\d{2})', txt, re.IGNORECASE)
+            if rent_date_m:
+                adjustments['rent_effective_date'] = rent_date_m.group(1)
+                
             # 4. Salary updates
-            sal_m = re.search(r'(?:salary (?:is|of|resumes)|pay is|first salary will be|reduced to|increased to|naik menjadi|dikurangi menjadi|gaji (?:pokok )?(?:yang dikonfirmasi )?adalah)\s+(?:[A-Z]{3}\s+)?([\d,]+(?:\.\d+)?)', txt, re.IGNORECASE)
+            sal_m = re.search(r'(?:salary (?:is|of|resumes)|pay is|first salary will be|reduced to|increased to|remaining confirmed monthly salary is|sisa gaji bulanan yang dikonfirmasi adalah|naik menjadi|dikurangi menjadi|gaji (?:pokok )?(?:yang dikonfirmasi )?adalah)\s+(?:[A-Z]{3}\s+)?([\d,]+(?:\.\d+)?)', txt, re.IGNORECASE)
             if sal_m:
                 val_str = sal_m.group(1).replace(',', '')
                 try:

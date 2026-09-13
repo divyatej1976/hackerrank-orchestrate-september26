@@ -187,14 +187,13 @@ class PlanEvaluator:
                         change_str = f'reduce_to:{ev_id}:{int(min_amt) if min_amt.is_integer() else min_amt:.2f}'
                         possible_actions.append(('reduce_to', ev_id, savings, change_str, min_amt))
                         
-            # Sort actions by savings potential descending to bound search
+            # Sort actions by savings potential descending
             possible_actions.sort(key=lambda a: a[2], reverse=True)
-            top_actions = possible_actions[:8]  # Bounded to top 8 actions
             
             # Generate valid combinations of 1, 2, and 3 actions (mutually exclusive event_ids)
             valid_combos = []
             for k in [1, 2, 3]:
-                for combo in combinations(top_actions, k):
+                for combo in combinations(possible_actions, k):
                     event_ids = [act[1] for act in combo]
                     if len(set(event_ids)) == len(event_ids):
                         valid_combos.append(combo)

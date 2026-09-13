@@ -197,11 +197,29 @@ def extract_amount_from_ocr_text(lines: List[str]) -> Optional[float]:
     if best_candidate is not None:
         return best_candidate[0]
         
-    # 3. Fallback: largest plausible currency-formatted number
-    all_amts = []
-    for l in lines:
-        all_amts.extend(extract_valid_amounts(l))
-    return max(all_amts) if all_amts else None
+    # 3. Contextual Fallback: score amounts by proximity to the bottom/total section and currency formatting
+    scored_candidates = []
+    total_lines = len(lines)
+    for idx, l in enumerate(lines):
+        line_amts = extract_valid_amounts(l)
+        has_currency_sym = bool(re.search(r'[\$€₹]|(?:rs|inr|usd|eur|zar|idr)\b', l, re.IGNORECASE))
+        has_decimal = '.' in l
+        # Prioritize lines toward the bottom third of the invoice where totals are positioned
+        rel_pos = (idx + 1) / max(1, total_lines)
+        for amt in line_amts:
+            score = 0.0
+            if has_currency_sym:
+                score += 2.0
+            if has_decimal:
+                score += 1.0
+            score += rel_pos  # lower on the page is more likely a total
+            scored_candidates.append((score, amt))
+            
+    if scored_candidates:
+        scored_candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        return scored_candidates[0][1]
+        
+    return None
 
 def resolve_image_amounts(events_df: pd.DataFrame, images_df: pd.DataFrame) -> pd.DataFrame:
     '''

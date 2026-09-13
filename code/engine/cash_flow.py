@@ -92,6 +92,12 @@ class CashFlowReconstructor:
                     daily_deltas[s_date] += amt
             elif dir_ == 'debit':
                 if st in ['pending', 'scheduled']:
+                    # Apply rent increase percentage to explicit future rent debits
+                    if ev['category'] == 'rent' and adjustments.get('rent_increase_pct', 0.0) > 0:
+                        rent_eff = adjustments.get('rent_effective_date')
+                        rent_eff_dt = pd.to_datetime(rent_eff) if rent_eff else None
+                        if rent_eff_dt is None or s_date >= rent_eff_dt:
+                            amt *= (1.0 + adjustments['rent_increase_pct'])
                     daily_deltas[s_date] -= amt
                     
         # 2. Extract recurring events from past history
@@ -129,12 +135,16 @@ class CashFlowReconstructor:
                 })
                 
             # Project recurring debits with calendar math
+            # Requires sufficient evidence: at least 3 occurrences, or 2 occurrences with low variance for contractual obligations (e.g. rent/utilities)
+            contractual_categories = {'rent', 'utilities', 'insurance', 'debt_repayment', 'education'}
             if len(dates) >= 2:
                 diffs = [(dates[i+1] - dates[i]).days for i in range(len(dates)-1)]
                 median_diff = int(np.median(diffs))
+                std_diff = float(np.std(diffs)) if len(diffs) > 1 else 0.0
+                has_sufficient_evidence = (len(dates) >= 3) or (cat in contractual_categories and std_diff <= 2.0)
                 
                 # Active monthly recurring bills (27 to 32 day cadence, must be recent within 45 days)
-                if 27 <= median_diff <= 32 and days_since <= 45:
+                if has_sufficient_evidence and 27 <= median_diff <= 32 and days_since <= 45:
                     anchor_dom = last_date.day
                     projected_dates = generate_monthly_dates(req_date, anchor_dom, end_date)
                     for p_date in projected_dates:
@@ -177,29 +187,43 @@ class CashFlowReconstructor:
         salary_ended = adjustments.get('salary_ended', False) or ('final' in last_sal_desc)
         
         if (len(past_salaries) >= 1 or has_future_scheduled_salary) and not salary_ended:
-            if has_future_scheduled_salary:
-                sched_sal = future_sched_salaries.iloc[0]
-                base_sal_date = sched_sal['settlement_date']
-                base_sal_amt = float(sched_sal['norm_amount'])
-            else:
-                base_sal_date = past_salaries['settlement_date'].max()
-                base_sal_amt = float(past_salaries['norm_amount'].iloc[-1])
-                
             eff_date = adjustments.get('salary_effective_date')
             eff_dt = pd.to_datetime(eff_date) if eff_date else None
             override_amt = adjustments.get('salary_override')
             
-            anchor_dom = base_sal_date.day
-            projected_salary_dates = generate_monthly_dates(req_date, anchor_dom, end_date)
-            
-            for p_date in projected_salary_dates:
-                # Avoid duplicating explicit future scheduled salary
-                if p_date in future_sched_salaries['settlement_date'].values:
-                    continue
-                cur_sal = base_sal_amt
-                if override_amt and (eff_dt is None or p_date >= eff_dt):
-                    cur_sal = override_amt
-                if p_date in daily_deltas:
-                    daily_deltas[p_date] += cur_sal
+            # If there is a salary override (e.g. remaining confirmed household stream or updated salary), project that single continuing stream
+            if override_amt is not None:
+                # Find anchor date from the most recent salary or scheduled salary
+                if has_future_scheduled_salary:
+                    base_sal_date = future_sched_salaries.iloc[0]['settlement_date']
+                else:
+                    base_sal_date = past_salaries['settlement_date'].max()
+                    
+                anchor_dom = base_sal_date.day
+                projected_salary_dates = generate_monthly_dates(req_date, anchor_dom, end_date)
+                for p_date in projected_salary_dates:
+                    if p_date in future_sched_salaries['settlement_date'].values:
+                        continue
+                    cur_sal = override_amt if (eff_dt is None or p_date >= eff_dt) else float(past_salaries['norm_amount'].iloc[-1])
+                    if p_date in daily_deltas:
+                        daily_deltas[p_date] += cur_sal
+            else:
+                # No override: project ongoing salary stream
+                if has_future_scheduled_salary:
+                    sched_sal = future_sched_salaries.iloc[0]
+                    base_sal_date = sched_sal['settlement_date']
+                    base_sal_amt = float(sched_sal['norm_amount'])
+                else:
+                    base_sal_date = past_salaries['settlement_date'].max()
+                    base_sal_amt = float(past_salaries['norm_amount'].iloc[-1])
+                    
+                anchor_dom = base_sal_date.day
+                projected_salary_dates = generate_monthly_dates(req_date, anchor_dom, end_date)
+                
+                for p_date in projected_salary_dates:
+                    if p_date in future_sched_salaries['settlement_date'].values:
+                        continue
+                    if p_date in daily_deltas:
+                        daily_deltas[p_date] += base_sal_amt
                     
         return daily_deltas, flexible_occurrences, flexible_catalog, adjustments

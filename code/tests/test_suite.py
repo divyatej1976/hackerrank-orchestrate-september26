@@ -212,5 +212,62 @@ class TestBuyOrWaitComprehensive(unittest.TestCase):
         earliest_blocked = sim.find_earliest_date_for_full_payment(start_bal, min_bal, req_amt, daily_deltas, req_date)
         self.assertIsNone(earliest_blocked)
 
+    # 10. Multi-stream salary continuation after partial household termination
+    def test_multi_stream_salary_continuation(self):
+        df_msgs = pd.DataFrame([
+            {'user_id': 'u_multi', 'message_text': 'A quick update. One household employment record has ended. The remaining confirmed monthly salary is INR 148000.'}
+        ])
+        parser = MessageParser(df_msgs)
+        adj = parser.get_user_adjustments('u_multi')
+        self.assertFalse(adj['salary_ended'])
+        self.assertEqual(adj['salary_override'], 148000.0)
+
+        # Test CashFlowReconstructor projects the continuing stream
+        df_events = pd.DataFrame([
+            {'event_id': 'e1', 'user_id': 'u_multi', 'event_type': 'income', 'category': 'salary',
+             'direction': 'credit', 'amount': 91760.0, 'currency': 'INR', 'event_date': '2025-12-15',
+             'settlement_date': pd.to_datetime('2025-12-15'), 'status': 'settled', 'flexibility': 'fixed',
+             'minimum_allowed_amount': np.nan, 'description': 'Primary household salary'}
+        ])
+        cfr = CashFlowReconstructor(df_events, self.fx, parser)
+        daily_deltas, _, _, _ = cfr.get_user_cash_schedule('u_multi', '2026-01-05', 'INR')
+        # Continuing salary should be credited in January at the override amount
+        jan_payday = pd.to_datetime('2026-01-15')
+        self.assertIn(jan_payday, daily_deltas)
+        self.assertEqual(daily_deltas[jan_payday], 148000.0)
+
+    # 11. Rent increase applied to explicit future debits and recurring rent
+    def test_rent_increase_on_explicit_and_recurring(self):
+        df_msgs = pd.DataFrame([
+            {'user_id': 'u_rent', 'message_text': 'The renewed lease increases monthly rent by 12%.'}
+        ])
+        parser = MessageParser(df_msgs)
+        
+        # Test explicit scheduled rent event
+        df_events = pd.DataFrame([
+            {'event_id': 'e_rent_fut', 'user_id': 'u_rent', 'event_type': 'expense', 'category': 'rent',
+             'direction': 'debit', 'amount': 1000.0, 'currency': 'USD', 'event_date': '2025-06-01',
+             'settlement_date': pd.to_datetime('2025-06-01'), 'status': 'scheduled', 'flexibility': 'fixed',
+             'minimum_allowed_amount': np.nan, 'description': 'Apartment rent transfer'}
+        ])
+        cfr = CashFlowReconstructor(df_events, self.fx, parser)
+        daily_deltas, _, _, _ = cfr.get_user_cash_schedule('u_rent', '2025-05-15', 'USD')
+        # Explicit future rent must reflect 12% increase -> -1120.0
+        self.assertEqual(daily_deltas[pd.to_datetime('2025-06-01')], -1120.0)
+
+    # 12. Independent Plan Safety Validator
+    def test_plan_safety_validation(self):
+        from utils.validator import validate_plan_safety
+        start_bal = 1000.0
+        min_bal = 500.0
+        req_date = pd.to_datetime('2025-01-01')
+        daily_deltas = {req_date + timedelta(days=i): 0.0 for i in range(91)}
+        
+        # Safe plan: paying 400 when start_bal=1000, min_bal=500
+        self.assertTrue(validate_plan_safety(start_bal, min_bal, daily_deltas, '2025-01-01:400', 'none', []))
+        
+        # Unsafe plan: paying 600 brings closing bal to 400 < 500
+        self.assertFalse(validate_plan_safety(start_bal, min_bal, daily_deltas, '2025-01-01:600', 'none', []))
+
 if __name__ == '__main__':
     unittest.main()
