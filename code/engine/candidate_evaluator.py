@@ -133,33 +133,46 @@ class PlanEvaluator:
         if (
             allows_partial and
             'partial_payment' in allowed_methods and
-            0 < amount_safe_today < req_amount - 1e-4 and
-            earliest_full_date is not None
+            0 < amount_safe_today < req_amount - 1e-4
         ):
-            efd = pd.to_datetime(earliest_full_date)
-            if efd <= desired_deadline:
-                p1_amt = amount_safe_today
-                p2_amt = req_amount - amount_safe_today
-                p1 = f'{req_date_str}:{int(p1_amt) if p1_amt.is_integer() else p1_amt:.2f}'
-                p2 = f'{earliest_full_date}:{int(p2_amt) if p2_amt.is_integer() else p2_amt:.2f}'
-                
-                pay_sched = {req_date: p1_amt, efd: p2_amt}
-                sim_deltas = dict(daily_deltas)
-                if efd not in sim_deltas:
-                    sim_deltas[efd] = 0.0
-                traj = self.sim.simulate_trajectory(start_bal, sim_deltas, payment_schedule=pay_sched)
-                if min(b for _, b in traj) >= min_bal - 1e-4:
-                    candidates.append(CandidatePlan(
-                        method='partial_payment',
-                        status='affordable_with_plan',
-                        plan_str=f'{p1}|{p2}',
-                        total_amount=req_amount,
-                        first_date=req_date_str,
-                        num_payments=2,
-                        option_id='payment_option_partial',
-                        spending_changes='none',
-                        completes_by_deadline=True
-                    ))
+            p1_amt = round(amount_safe_today, 2)
+            p2_amt = round(req_amount - p1_amt, 2)
+            reduced_start_bal = start_bal - p1_amt
+            next_day = req_date + timedelta(days=1)
+            
+            # Find earliest safe date specifically for remainder amount after p1 has been paid
+            rem_safe_date = self.sim.find_earliest_safe_date_for_amount(
+                starting_balance=reduced_start_bal,
+                min_balance=min_bal,
+                amount=p2_amt,
+                daily_deltas=daily_deltas,
+                req_date=req_date,
+                start_from_date=next_day
+            )
+            
+            if rem_safe_date is not None:
+                rem_dt = pd.to_datetime(rem_safe_date)
+                if rem_dt <= desired_deadline:
+                    p1 = f'{req_date_str}:{int(p1_amt) if p1_amt.is_integer() else p1_amt:.2f}'
+                    p2 = f'{rem_safe_date}:{int(p2_amt) if p2_amt.is_integer() else p2_amt:.2f}'
+                    
+                    pay_sched = {req_date: p1_amt, rem_dt: p2_amt}
+                    sim_deltas = dict(daily_deltas)
+                    if rem_dt not in sim_deltas:
+                        sim_deltas[rem_dt] = 0.0
+                    traj = self.sim.simulate_trajectory(start_bal, sim_deltas, payment_schedule=pay_sched)
+                    if min(b for _, b in traj) >= min_bal - 1e-4:
+                        candidates.append(CandidatePlan(
+                            method='partial_payment',
+                            status='affordable_with_plan',
+                            plan_str=f'{p1}|{p2}',
+                            total_amount=req_amount,
+                            first_date=req_date_str,
+                            num_payments=2,
+                            option_id='payment_option_partial',
+                            spending_changes='none',
+                            completes_by_deadline=True
+                        ))
                     
         # --- 4. Flexible Spending Adjustments (1, 2, or 3 distinct modifications) ---
         if amount_safe_today < req_amount - 1e-4 and flexible_catalog and 'full_payment' in allowed_methods:

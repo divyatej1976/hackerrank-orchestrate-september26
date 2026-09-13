@@ -176,6 +176,26 @@ class CashFlowReconstructor:
                                     'flexibility': flex
                                 })
                         curr += timedelta(days=median_diff)
+
+        # 2b. Category-level fallback for essential categories (e.g. groceries, transport)
+        # not captured by description-level matching due to varied merchant descriptions.
+        covered_cats = {occ['category'] for occ in flexible_occurrences}
+        for (desc, cat), grp in past_debits.groupby(['description', 'category']):
+            dates = grp['settlement_date'].sort_values().tolist()
+            if len(dates) >= 2:
+                diffs = [(dates[i+1] - dates[i]).days for i in range(len(dates)-1)]
+                median_diff = int(np.median(diffs))
+                days_since = (req_date - dates[-1]).days
+                if (27 <= median_diff <= 32 and days_since <= 45) or (5 <= median_diff <= 25 and len(diffs) >= 3 and days_since <= (median_diff * 2 + 2)):
+                    covered_cats.add(cat)
+
+        window_start = req_date - timedelta(days=45)
+        recent_debits = past_debits[(past_debits['settlement_date'] >= window_start) & (past_debits['settlement_date'] < req_date)]
+        for cat, grp in recent_debits.groupby('category'):
+            if cat not in covered_cats and len(grp) >= 3:
+                avg_daily_rate = float(grp['norm_amount'].sum()) / 45.0
+                for d in daily_deltas:
+                    daily_deltas[d] -= avg_daily_rate
                         
         # 3. Project future monthly salaries if recurring and employment has not ended
         past_salaries = past_events[(past_events['direction'] == 'credit') & (past_events['category'] == 'salary') & (past_events['status'] == 'settled')]

@@ -269,5 +269,25 @@ class TestBuyOrWaitComprehensive(unittest.TestCase):
         # Unsafe plan: paying 600 brings closing bal to 400 < 500
         self.assertFalse(validate_plan_safety(start_bal, min_bal, daily_deltas, '2025-01-01:600', 'none', []))
 
+    # 13. Earliest Safe Date for Remainder Amount
+    def test_earliest_safe_date_for_amount(self):
+        sim = FinancialSimulator(forecast_days=90)
+        start_bal = 1000.0
+        min_bal = 500.0
+        req_date = pd.to_datetime('2025-01-01')
+        daily_deltas = {req_date + timedelta(days=i): 0.0 for i in range(91)}
+        daily_deltas[req_date + timedelta(days=15)] = 500.0
+        
+        # Test finding earliest safe date for remainder of 600
+        rem_date = sim.find_earliest_safe_date_for_amount(
+            starting_balance=500.0,
+            min_balance=min_bal,
+            amount=400.0,
+            daily_deltas=daily_deltas,
+            req_date=req_date,
+            start_from_date=req_date + timedelta(days=1)
+        )
+        self.assertEqual(rem_date, '2025-01-16')
+
 if __name__ == '__main__':
     unittest.main()

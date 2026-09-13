@@ -1,4 +1,4 @@
-﻿import pandas as pd
+import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional
@@ -53,6 +53,39 @@ class FinancialSimulator:
             traj = self.simulate_trajectory(starting_balance, daily_deltas, payment_schedule=cand_payment)
             
             # Check if all balances from cand_date onwards are >= min_balance
+            valid = True
+            for d, bal in traj:
+                if d >= cand_date:
+                    if bal < min_balance - 1e-4:
+                        valid = False
+                        break
+            if valid:
+                return cand_date.strftime('%Y-%m-%d')
+                
+        return None
+
+    def find_earliest_safe_date_for_amount(
+        self,
+        starting_balance: float,
+        min_balance: float,
+        amount: float,
+        daily_deltas: Dict[pd.Timestamp, float],
+        req_date: pd.Timestamp,
+        start_from_date: Optional[pd.Timestamp] = None
+    ) -> Optional[str]:
+        '''
+        Finds the earliest calendar date on or after start_from_date (defaulting to req_date)
+        where paying 'amount' is safe across the entire subsequent forecast period.
+        '''
+        from_dt = start_from_date if start_from_date is not None else req_date
+        sorted_dates = sorted(daily_deltas.keys())
+        
+        for cand_date in sorted_dates:
+            if cand_date < from_dt:
+                continue
+            cand_payment = {cand_date: amount}
+            traj = self.simulate_trajectory(starting_balance, daily_deltas, payment_schedule=cand_payment)
+            
             valid = True
             for d, bal in traj:
                 if d >= cand_date:
